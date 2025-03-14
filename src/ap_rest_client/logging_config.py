@@ -1,3 +1,4 @@
+from datetime import UTC, datetime
 import json
 import logging
 import logging.config
@@ -15,26 +16,55 @@ class JSONFormatter(logging.Formatter):
     - Captures exceptions with stack trace when applicable.
     """
 
-    def format(self, record: logging.LogRecord) -> str:
-        log_data = {
-            "timestamp": self.formatTime(record),  # ISO 8601 format
-            "level": record.levelname,
-            "message": record.getMessage(),
-            "module": record.module,
-            "function": record.funcName,
-            "line": record.lineno,
-            "logger": record.name,
-            "pid": record.process,
-        }
 
+class JSONFormatter(logging.Formatter):
+    """
+    Custom logging formatter that outputs logs in structured JSON format.
+
+    - Includes timestamp, log level, message, module, function, and line number.
+    - Captures exceptions with stack trace when applicable.
+    """
+
+    def format(self, record: logging.LogRecord) -> str:
+        log_data = {}
+
+        # If `record.msg` is already a dictionary, use it directly
+        if isinstance(record.msg, dict):
+            log_data.update(record.msg)
+        else:
+            log_data["message"] = str(record.getMessage())  # Ensure message is a string
+
+        # Standard metadata fields
+        log_data.update(
+            {
+                "timestamp": self.format_time(record),
+                "level": record.levelname,
+                "module": record.module,
+                "function": record.funcName,
+                "line": record.lineno,
+                "logger": record.name,
+                "pid": record.process,
+            }
+        )
+
+        # Handle exception information
         if record.exc_info:
+            exc_type, exc_value, _ = record.exc_info  # Unpacking exception details
             log_data["error"] = {
-                "type": str(record.exc_info[0]),
-                "message": str(record.exc_info[1]),
+                "type": (
+                    exc_type.__name__ if exc_type else "UnknownException"
+                ),  # Safely handle None
+                "message": str(exc_value) if exc_value else "No exception message",
                 "stack_trace": traceback.format_exc(),
             }
 
-        return json.dumps(log_data)
+        return json.dumps(
+            log_data, default=str
+        )  # Use `default=str` to serialize non-serializable objects
+
+    def format_time(self, record: logging.LogRecord) -> str:
+        """Format the log timestamp to ISO 8601 with UTC timezone."""
+        return datetime.fromtimestamp(record.created, tz=UTC).isoformat()
 
 
 def get_log_dir() -> Path:

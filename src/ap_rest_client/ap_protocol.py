@@ -15,7 +15,7 @@ from langgraph.types import Command
 from langgraph.graph import END, START, StateGraph
 from langgraph.graph.message import add_messages
 from langchain_core.messages.utils import convert_to_openai_messages
-from logging_config import configure_logging
+from ap_rest_client.logging_config import configure_logging
 from requests.exceptions import (
     ConnectionError as RequestsConnectionError,
     HTTPError,
@@ -326,12 +326,16 @@ def invoke_graph(
 def main():
     load_environment_variables()
     remote_agent_url = os.getenv("REMOTE_AGENT_URL", "http://127.0.0.1:8123/api/v1/runs")
-    graph = build_graph(
-        remote_agent_url=(remote_agent_url)
-    )
+    graph = build_graph()
+    config = {
+        "configurable": {
+            "remote_agent_url": remote_agent_url,
+            "thread_id": str(uuid.uuid4()),
+        }
+    }    
     inputs = {"messages": [HumanMessage(content="Write a story about a cat")]}
     logger.info({"event": "invoking_graph", "inputs": inputs})
-    result = graph.invoke(inputs)
+    result = graph.invoke(inputs, config=config)
     logger.info({"event": "final_result", "result": result})
 
 
