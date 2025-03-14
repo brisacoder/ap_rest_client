@@ -1,6 +1,6 @@
 [project]
 name = "ap-rest-client"
-version = "0.0.1"
+version = "0.0.5"
 description = ""
 authors = [
     {name = "brisacoder",email = "dev@brisa.ai"}
@@ -25,6 +25,7 @@ dependencies = [
 ]
 
 include = ["ap_rest_client/data/langgraph.json"]  
+exclude = ["logs", "logs/**"]
 
 [tool.poetry]
 packages = [{include = "ap_rest_client", from = "src"}]

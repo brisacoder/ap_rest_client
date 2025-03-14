@@ -1,12 +1,17 @@
-# Description: This file contains a sample graph client that makes a stateless request to the Remote Graph Server.
-# Usage: python3 client/rest.py
+"""
+This module defines the protocol for interacting with a remote agent service via REST API.
+It includes functions for loading environment variables, decoding responses, and handling
+graph state and configuration. The main functionality revolves around building and invoking
+a state graph that communicates with the remote agent service to process messages and handle
+exceptions.
+"""
 
 import json
 import logging
 import os
 import traceback
 import uuid
-from typing import Annotated, Any, Dict, List, Literal, Optional, TypedDict
+from typing import Annotated, Any, Dict, List, Literal, Optional, Union
 
 import requests
 from dotenv import find_dotenv, load_dotenv
@@ -31,21 +36,13 @@ handler.setFormatter(logging.Formatter("%(asctime)s - %(levelname)s - %(message)
 logger.addHandler(handler)
 
 
-def load_environment_variables(env_file: str | None = None) -> None:
+def load_environment_variables(env_file: Optional[str] = None) -> None:
     """
     Load environment variables from a .env file safely.
 
-    This function loads environment variables from a `.env` file, ensuring
-    that critical configurations are set before the application starts.
-
     Args:
-        env_file (str | None): Path to a specific `.env` file. If None,
-                               it searches for a `.env` file automatically.
-
-    Behavior:
-    - If `env_file` is provided, it loads the specified file.
-    - If `env_file` is not provided, it attempts to locate a `.env` file in the project directory.
-    - Logs a warning if no `.env` file is found.
+        env_file (Optional[str]): Path to a specific `.env` file. If None,
+                                  it searches for a `.env` file automatically.
 
     Returns:
         None
@@ -54,7 +51,7 @@ def load_environment_variables(env_file: str | None = None) -> None:
 
     if env_path:
         load_dotenv(env_path, override=True)
-        logger.info(f".env file loaded from {env_path}")
+        logger.info(".env file loaded from %s", env_path)
     else:
         logger.warning("No .env file found. Ensure environment variables are set.")
 
@@ -84,8 +81,10 @@ def decode_response(response_data: Dict[str, Any]) -> Dict[str, Any]:
             "model": model,
             "metadata": metadata,
         }
-    except Exception as e:
+    except (ValueError, TypeError, KeyError) as e:
         return {"error": f"Failed to decode response: {str(e)}"}
+    except Exception as e:
+        return {"error": f"An unexpected error occurred: {str(e)}"}
 
 
 class GraphState(BaseModel):
@@ -118,10 +117,12 @@ class GraphConfig(BaseModel):
     )
 
 
-def default_state() -> Dict:
+def default_state() -> Dict[str, Any]:
     """
-    A benign default return for nodes in the graph
-    that do not modify state
+    A benign default return for nodes in the graph that do not modify state.
+
+    Returns:
+        Dict[str, Any]: Default state with empty messages.
     """
     return {
         "messages": [],
@@ -137,24 +138,25 @@ def node_remote_agent(
 
     Args:
         state (GraphState): The current graph state containing messages.
+        config (RunnableConfig): Configuration for the graph execution.
 
     Returns:
-        Dict[str, List[BaseMessage]]: Updated state containing server response or error message.
+        Command[Literal["exception_node", "end_node"]]: Command to transition to the next node.
     """
     if not state.messages:
-        logger.error(json.dumps({"error": "GraphState contains no messages"}))
+        logger.error("GraphState contains no messages")
         return Command(
             goto="exception_node",
-            update={"exception_text": "Error: No messages in state"},
+            update={"exception_text": "GraphState contains no messages"},
         )
 
     # Extract the latest user query
     messages = state.messages
     human_message = messages[-1].content
-    logger.info(json.dumps({"event": "sending_request", "human": human_message}))
+    logger.info("sending message: %s", human_message)
 
     # Request headers
-    headers = {
+    json_headers = {
         "Accept": "application/json",
         "Content-Type": "application/json",
     }
@@ -169,103 +171,138 @@ def node_remote_agent(
         "metadata": {"id": str(uuid.uuid4())},
     }
 
-    # Use a session for efficiency
-    session = requests.Session()
+    # Use a context manager for the session
+    with requests.Session() as session:
+        try:
+            remote_agent_url = config["configurable"].get("remote_agent_url")
+            rest_timeout = config["configurable"].get("rest_timeout")
+            response = session.post(
+                remote_agent_url, headers=json_headers, json=payload, timeout=rest_timeout
+            )
 
-    try:
-        remote_agent_url = config["configurable"].get("remote_agent_url")
-        response = session.post(
-            remote_agent_url, headers=headers, json=payload, timeout=30
-        )
+            # Raise exception for HTTP errors
+            response.raise_for_status()
 
-        # Raise exception for HTTP errors
-        response.raise_for_status()
+            # Parse response as JSON
+            response_data = response.json()
+            # Decode JSON response
+            decoded_response = decode_response(response_data)
 
-        # Parse response as JSON
-        response_data = response.json()
-        # Decode JSON response
-        decoded_response = decode_response(response_data)
+            logger.info(decoded_response)
 
-        logger.info(decoded_response)
+            messages = decoded_response.get("messages", [])
 
-        messages = decoded_response.get("messages", [])
+            # This is tricky. In multi-turn conversation we should only add new messages
+            # produced by the remote agent, otherwise we will have duplicates.
+            # In this App we will assume remote agent only create a single new message but
+            # this is not always true
 
-        # This is tricky. In multi-turn conversation we should only add new messages
-        # produced by the remote agent, otherwise we will have duplicates.
-        # In this App we will assume remote agent only create a single new message but
-        # this is not always true
+            return Command(goto="end_node", update={"messages": messages[-1]})
 
-        return Command(goto="end_node", update={"messages": messages[-1]})
+        except Timeout as timeout_err:
+            error_msg = {
+                "error": "Connection timeout",
+                "exception": str(timeout_err),
+            }
+            logger.error(json.dumps(error_msg))
+            return Command(
+                goto="exception_node", update={"exception_msg": json.dumps(error_msg)}
+            )
 
-    except (Timeout, RequestsConnectionError) as conn_err:
-        error_msg = {
-            "error": "Connection timeout or failure",
-            "exception": str(conn_err),
-        }
-        logger.error(json.dumps(error_msg))
+        except RequestsConnectionError as conn_err:
+            error_msg = {
+                "error": "Connection failure",
+                "exception": str(conn_err),
+            }
+            logger.error(json.dumps(error_msg))
+            return Command(
+                goto="exception_node", update={"exception_msg": json.dumps(error_msg)}
+            )
 
-        return Command(
-            goto="exception_node", update={"exception_msg": json.dumps(error_msg)}
-        )
+        except HTTPError as http_err:
+            error_msg = {
+                "error": "HTTP request failed",
+                "status_code": response.status_code,
+                "exception": str(http_err),
+            }
+            logger.error(json.dumps(error_msg))
+            return Command(
+                goto="exception_node", update={"exception_msg": json.dumps(error_msg)}
+            )
 
-    except HTTPError as http_err:
-        error_msg = {
-            "error": "HTTP request failed",
-            "status_code": response.status_code,
-            "exception": str(http_err),
-        }
-        logger.error(json.dumps(error_msg))
-        return Command(
-            goto="exception_node", update={"exception_msg": json.dumps(error_msg)}
-        )
+        except RequestException as req_err:
+            error_msg = {"error": "Request failed", "exception": str(req_err)}
+            logger.error(json.dumps(error_msg))
+            return Command(
+                goto="exception_node", update={"exception_msg": json.dumps(error_msg)}
+            )
 
-    except RequestException as req_err:
-        error_msg = {"error": "Request failed", "exception": str(req_err)}
-        logger.error(json.dumps(error_msg))
-        return Command(
-            goto="exception_node", update={"exception_msg": json.dumps(error_msg)}
-        )
+        except json.JSONDecodeError as json_err:
+            error_msg = {"error": "Invalid JSON response", "exception": str(json_err)}
+            logger.error(json.dumps(error_msg))
+            return Command(
+                goto="exception_node", update={"exception_msg": json.dumps(error_msg)}
+            )
 
-    except json.JSONDecodeError as json_err:
-        error_msg = {"error": "Invalid JSON response", "exception": str(json_err)}
-        logger.error(json.dumps(error_msg))
-        return Command(
-            goto="exception_node", update={"exception_msg": json.dumps(error_msg)}
-        )
+        except (ValueError, TypeError, KeyError) as e:
+            error_msg = {
+                "error": "Unexpected failure",
+                "exception": str(e),
+                "stack_trace": traceback.format_exc(),
+            }
+            logger.error(json.dumps(error_msg))
+            return Command(
+                goto="exception_node", update={"exception_msg": json.dumps(error_msg)}
+            )
 
-    except Exception as e:
-        error_msg = {
-            "error": "Unexpected failure",
-            "exception": str(e),
-            "stack_trace": traceback.format_exc(),
-        }
-        logger.error(json.dumps(error_msg))
-        return Command(
-            goto="exception_node", update={"exception_msg": json.dumps(error_msg)}
-        )
-
-    finally:
-        session.close()
+        except Exception as e:
+            error_msg = {
+                "error": "An unexpected error occurred",
+                "exception": str(e),
+                "stack_trace": traceback.format_exc(),
+            }
+            logger.error(json.dumps(error_msg))
+            return Command(
+                goto="exception_node", update={"exception_msg": json.dumps(error_msg)}
+            )
 
 
 # Graph node that makes a stateless request to the Remote Graph Server
 def end_node(state: GraphState) -> Dict[str, Any]:
-    logger.info(f"Thread end: {state.model_dump().values()}")
+    """
+    Final node in the graph execution.
+
+    Args:
+        state (GraphState): The current graph state.
+
+    Returns:
+        Dict[str, Any]: Default state.
+    """
+    logger.info("Thread end: %s", state.model_dump().values())
     return default_state()
 
 
-def exception_node(state: GraphState):
-    logger.info(f"Exception happen while processing graph: {state.exception_msg}")
+def exception_node(state: GraphState) -> Dict[str, Any]:
+    """
+    Node to handle exceptions during graph execution.
+
+    Args:
+        state (GraphState): The current graph state.
+
+    Returns:
+        Dict[str, Any]: Default state.
+    """
+    logger.info("Exception happen while processing graph: %s", state.exception_msg)
     return default_state()
 
 
 # Build the state graph
 def build_graph() -> CompiledGraph:
     """
-    Constructed a compiled graph that can be invoked stand-alone or used in Langgraph Studio
+    Construct a compiled graph that can be invoked stand-alone or used in Langgraph Studio.
 
     Returns:
-        StateGraph: A compiled LangGraph state graph.
+        CompiledGraph: A compiled LangGraph state graph.
     """
     builder = StateGraph(state_schema=GraphState, config_schema=GraphConfig)
     builder.add_node("node_remote_agent", node_remote_agent)
@@ -283,25 +320,22 @@ def invoke_graph(
     graph: Optional[Any] = None,
     remote_agent_url: Optional[str] = None,
     rest_timeout: Optional[int] = None,
-) -> Optional[dict[Any, Any] | list[dict[Any, Any]]]:
+) -> Optional[Union[dict[Any, Any], list[dict[Any, Any]]]]:
     """
     Invokes the graph with the given messages and safely extracts the last AI-generated message.
 
-    - Logs errors if keys or indices are missing.
-    - Ensures the graph is initialized if not provided.
-    - Returns a meaningful response even if an error occurs.
+    Args:
+        messages (List[Dict[str, str]]): A list of message dictionaries in OpenAI format.
+        graph (Optional[Any]): An optional langgraph CompiledStateGraph object to use;
+        default graph will be built if none provided.
+        remote_agent_url (Optional[str]): The URL for the remote agent.
+        rest_timeout (Optional[int]): The timeout for REST requests.
 
-    :param messages: A list of message dictionaries in OpenAI format.
-    :param graph: An optional langgraph CompiledStateGraph object to use; internal will be built if not provided.
-    :param remote_agent_url: The URL for the remote agent. Precedence:
-                             1) User-provided value,
-                             2) Environment variable REMOTE_AGENT_URL,
-                             3) Default fallback.
-    :param rest_timeout: The timeout for REST requests. Precedence:
-                             1) User-provided value,
-                             2) Environment variable REST_TIMEOUT,
-                             3) Default fallback.
-    :return: The list of all messages returned by the graph.
+    Returns:
+        Optional[Union[
+            dict[Any, Any],
+            list[dict[Any, Any]]
+        ]]: The list of all messages returned by the graph.
     """
 
     load_environment_variables()
@@ -312,9 +346,9 @@ def invoke_graph(
             "REMOTE_AGENT_URL", "http://127.0.0.1:8123/api/v1/runs"
         )
 
-    # Same for rest _timeout
+    # Same for rest_timeout
     if rest_timeout is None:
-        rest_timeout = int(os.getenv("rest_timeout", 30))
+        rest_timeout = int(os.getenv("rest_timeout", "30"))
 
     inputs = {"messages": messages}
     logger.debug({"event": "invoking_graph", "inputs": inputs})
@@ -347,33 +381,43 @@ def invoke_graph(
             raise KeyError(f"Last message does not contain 'content': {last_message}")
 
         ai_message_content = last_message["content"]
-        logger.info(f"AI message content: {ai_message_content}")
+        logger.info("AI message content: %s", ai_message_content)
         return messages_list
 
-    except Exception as e:
-        logger.error(f"Error invoking graph: {e}", exc_info=True)
+    except (TypeError, ValueError, KeyError) as e:
+        logger.error("Error invoking graph: %s", e, exc_info=True)
         return [{"role": "assistant", "content": "Error processing user message"}]
+    except Exception as e:
+        logger.error("An unexpected error occurred: %s", e, exc_info=True)
+        return [{"role": "assistant", "content": "An unexpected error occurred"}]
 
 
-def main():
+def main() -> None:
+    """
+    Main function to load environment variables, configure logging, and invoke the graph.
+    """
     load_environment_variables()
     _ = configure_logging()
+
     remote_agent_url = os.getenv(
         "REMOTE_AGENT_URL", "http://127.0.0.1:8123/api/v1/runs"
     )
-    rest_timeout = int(os.getenv("REST_TIMEOUT", 30))
-    graph = build_graph()
-    config = {
-        "configurable": {
-            "remote_agent_url": remote_agent_url,
-            "thread_id": str(uuid.uuid4()),
-            "rest_timeout": rest_timeout,
-        }
-    }
-    inputs = {"messages": [HumanMessage(content="Write a story about a cat")]}
-    logger.info({"event": "invoking_graph", "inputs": inputs})
-    result = graph.invoke(inputs, config=config)
-    logger.info({"event": "final_result", "result": result})
+    rest_timeout = int(os.getenv("REST_TIMEOUT", "30"))
+    try:
+        graph = build_graph()
+        graph_config = GraphConfig(
+            remote_agent_url=remote_agent_url,
+            rest_timeout=rest_timeout,
+            thread_id=str(uuid.uuid4()),
+        )
+        config: RunnableConfig = {"configurable": graph_config.model_dump()}
+        inputs = {"messages": [HumanMessage(content="Write a story about a cat")]}
+        logger.info({"event": "invoking_graph", "inputs": inputs})
+        result = graph.invoke(inputs, config=config)
+        logger.info({"event": "final_result", "result": result})
+    except Exception as e:
+        logger.error(
+            "An unexpected error occurred in main execution: %s", e, exc_info=True)
 
 
 # Main execution

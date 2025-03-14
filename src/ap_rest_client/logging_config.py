@@ -1,3 +1,8 @@
+"""
+This module provides logging configuration for the remote graphs client.
+It sets up structured JSON logging with rotation and supports logging to both console and file.
+"""
+
 import logging
 import os
 from logging.handlers import RotatingFileHandler
@@ -19,10 +24,15 @@ def get_log_level() -> str:
 
 
 def configure_logging() -> logging.Logger:
-    """Configures structured JSON logging with rotation."""
+    """
+    Configures structured JSON logging with rotation.
+
+    Logs to both console and a rotating file handler.
+    The log level is determined by the LOG_LEVEL environment variable.
+    """
     log_dir = get_log_dir()
     log_file = log_dir / "ap_rest_client.log"
-    log_level = get_log_level()
+    log_level: str = get_log_level()
 
     logger = logging.getLogger()
     logger.setLevel(log_level)
