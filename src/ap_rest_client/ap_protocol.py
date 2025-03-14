@@ -1,8 +1,8 @@
 # Description: This file contains a sample graph client that makes a stateless request to the Remote Graph Server.
 # Usage: python3 client/rest.py
 
-import argparse
 import json
+import logging
 import os
 import traceback
 import uuid
@@ -10,7 +10,8 @@ from typing import Annotated, Any, Dict, List, Literal, Optional, TypedDict
 
 import requests
 from dotenv import find_dotenv, load_dotenv
-from langchain_core.messages import AIMessage, BaseMessage, HumanMessage
+from langchain_core.messages import BaseMessage, HumanMessage
+from langchain_core.runnables.config import RunnableConfig
 from langgraph.types import Command
 from langgraph.graph import END, START, StateGraph
 from langgraph.graph.message import add_messages
@@ -23,11 +24,12 @@ from requests.exceptions import (
     Timeout,
 )
 
-# Initialize logger
-logger = configure_logging()
-
-# URL for the Remote Graph Server /runs endpoint
-REMOTE_SERVER_URL = "http://127.0.0.1:8123/api/v1/runs"
+# Step 1: Initialize a basic logger first (to avoid errors before full configuration)
+logger = logging.getLogger()
+logger.setLevel(logging.INFO)  # Minimal level before full configuration
+handler = logging.StreamHandler()
+handler.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
+logger.addHandler(handler)
 
 
 def load_environment_variables(env_file: str | None = None) -> None:
@@ -98,6 +100,7 @@ class GraphState(TypedDict):
 class GraphConfig(TypedDict):
     remote_agent_url: str
     thread_id: str
+    rest_timeout: int
 
 
 def default_state() -> Dict:
@@ -112,7 +115,7 @@ def default_state() -> Dict:
 
 # Graph node that makes a stateless request to the Remote Graph Server
 def node_remote_agent(
-    state: GraphState,
+    state: GraphState, config: RunnableConfig
 ) -> Command[Literal["exception_node", "end_node"]]:
     """
     Sends a stateless request to the Remote Graph Server.
@@ -154,8 +157,9 @@ def node_remote_agent(
     session = requests.Session()
 
     try:
+        remote_agent_url = config["configurable"].get("remote_agent_url")
         response = session.post(
-            REMOTE_SERVER_URL, headers=headers, json=payload, timeout=30
+            remote_agent_url, headers=headers, json=payload, timeout=30
         )
 
         # Raise exception for HTTP errors
@@ -261,7 +265,8 @@ def build_graph() -> Any:
 def invoke_graph(
     messages: List[Dict[str, str]],
     graph: Optional[Any] = None,
-    remote_agent_url: Optional[str] = None
+    remote_agent_url: Optional[str] = None,
+    rest_timeout: Optional[int] = None
 ) -> Optional[dict[Any, Any] | list[dict[Any, Any]]]:
     """
     Invokes the graph with the given messages and safely extracts the last AI-generated message.
@@ -283,7 +288,14 @@ def invoke_graph(
 
     # Apply precedence rules for remote_agent_url
     if remote_agent_url is None:
-        remote_agent_url = os.getenv("REMOTE_AGENT_URL", "http://127.0.0.1:8123/api/v1/runs")
+        remote_agent_url = os.getenv(
+            "REMOTE_AGENT_URL", "http://127.0.0.1:8123/api/v1/runs"
+        )
+
+    # Same for rest _timeout
+    if rest_timeout is None:
+        rest_timeout = int(os.getenv(
+            "rest_timeout", 30))
 
     inputs = {"messages": messages}
     logger.debug({"event": "invoking_graph", "inputs": inputs})
@@ -291,6 +303,7 @@ def invoke_graph(
     config = {
         "configurable": {
             "remote_agent_url": remote_agent_url,
+            "rest_timeout": rest_timeout,
             "thread_id": str(uuid.uuid4()),
         }
     }
@@ -325,14 +338,20 @@ def invoke_graph(
 
 def main():
     load_environment_variables()
-    remote_agent_url = os.getenv("REMOTE_AGENT_URL", "http://127.0.0.1:8123/api/v1/runs")
+    logger = configure_logging()
+    remote_agent_url = os.getenv(
+        "REMOTE_AGENT_URL", "http://127.0.0.1:8123/api/v1/runs"
+    )
+    rest_timeout = int(os.getenv("REST_TIMEOUT", 30))
     graph = build_graph()
     config = {
         "configurable": {
             "remote_agent_url": remote_agent_url,
             "thread_id": str(uuid.uuid4()),
+            "rest_timeout": rest_timeout,
+
         }
-    }    
+    }
     inputs = {"messages": [HumanMessage(content="Write a story about a cat")]}
     logger.info({"event": "invoking_graph", "inputs": inputs})
     result = graph.invoke(inputs, config=config)
