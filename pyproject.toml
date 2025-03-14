@@ -1,0 +1,34 @@
+[project]
+name = "ap-rest-client"
+version = "0.0.1"
+description = ""
+authors = [
+    {name = "brisacoder",email = "dev@brisa.ai"}
+]
+readme = "README.md"
+requires-python = ">=3.13,<4.0"
+dependencies = [
+    "fastapi[standard] (==0.115.11)",
+    "requests (==2.32.3)",
+    "starlette (==0.46.0)",
+    "uvicorn (==0.34.0)",
+    "packaging (==24.2)",
+    "python-dotenv (==1.0.1)",
+    "pydantic (==2.10.6)",
+    "pydantic-settings (==2.8.1)",
+    "langgraph (==0.3.2)",
+    "langchain (==0.3.19)",
+    "langgraph-sdk (==0.1.53)",
+    "langgraph-cli[inmem] (==0.1.74)",
+    "langchain-openai (==0.3.8)"
+]
+
+include = ["ap_rest_client/data/langgraph.json"]  
+
+[tool.poetry]
+packages = [{include = "ap_rest_client", from = "src"}]
+
+
+[build-system]
+requires = ["poetry-core>=2.0.0,<3.0.0"]
+build-backend = "poetry.core.masonry.api"

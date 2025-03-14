@@ -1,0 +1,7 @@
+{
+    "dependencies": ["../../../pyproject.toml", "..", "."],
+    "graphs": {
+        "ap_local_agent": "../ap_protocol.py:build_graph"
+    },
+    "env": "./.env"
+}
