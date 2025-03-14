@@ -255,7 +255,7 @@ def build_graph() -> Any:
     builder.add_edge(START, "node_remote_agent")
     builder.add_edge("exception_node", END)
     builder.add_edge("end_node", END)
-    return builder.compile(name="local_agent")
+    return builder.compile(name="ap_local_agent")
 
 
 def invoke_graph(
