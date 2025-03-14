@@ -11,24 +11,23 @@ from typing import Annotated, Any, Dict, List, Literal, Optional, TypedDict
 import requests
 from dotenv import find_dotenv, load_dotenv
 from langchain_core.messages import BaseMessage, HumanMessage
-from langchain_core.runnables.config import RunnableConfig
-from langgraph.types import Command
-from langgraph.graph import END, START, StateGraph
-from langgraph.graph.message import add_messages
 from langchain_core.messages.utils import convert_to_openai_messages
+from langchain_core.runnables.config import RunnableConfig
+from langgraph.graph import END, START, StateGraph
+from langgraph.graph.graph import CompiledGraph
+from langgraph.graph.message import add_messages
+from langgraph.types import Command
+from pydantic import BaseModel, Field
+from requests.exceptions import ConnectionError as RequestsConnectionError
+from requests.exceptions import HTTPError, RequestException, Timeout
+
 from ap_rest_client.logging_config import configure_logging
-from requests.exceptions import (
-    ConnectionError as RequestsConnectionError,
-    HTTPError,
-    RequestException,
-    Timeout,
-)
 
 # Step 1: Initialize a basic logger first (to avoid errors before full configuration)
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)  # Minimal level before full configuration
 handler = logging.StreamHandler()
-handler.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
+handler.setFormatter(logging.Formatter("%(asctime)s - %(levelname)s - %(message)s"))
 logger.addHandler(handler)
 
 
@@ -89,28 +88,34 @@ def decode_response(response_data: Dict[str, Any]) -> Dict[str, Any]:
         return {"error": f"Failed to decode response: {str(e)}"}
 
 
-class GraphState(TypedDict):
-    """Represents the state of the graph, containing messages and error details.
+class GraphState(BaseModel):
+    """Represents the state of the graph, containing messages and an optional error message."""
 
-    :param messages: List of messages exchanged within the graph session.
-    :param exception_msg: Error message in case of exceptions during execution.
-    """
+    messages: Annotated[List[BaseMessage], add_messages] = Field(
+        ..., description="List of messages exchanged within the graph session."
+    )
 
-    messages: Annotated[List[BaseMessage], add_messages]
-    exception_msg: str
+    exception_msg: Optional[str] = Field(
+        None,
+        description="Optional error message in case of exceptions during execution.",
+    )
 
 
-class GraphConfig(TypedDict):
-    """Configuration for the graph execution, including remote agent details.
+class GraphConfig(BaseModel):
+    """Configuration for the graph execution, including remote agent details."""
 
-    :param remote_agent_url: URL of the remote agent service.
-    :param thread_id: Unique identifier for the execution thread.
-    :param rest_timeout: Timeout (in seconds) for REST API requests.
-    """
+    remote_agent_url: str = Field(
+        "http://127.0.0.1:8123/api/v1/runs",
+        description="URL of the remote agent service. Defaults to local server.",
+    )
 
-    remote_agent_url: str
-    thread_id: str
-    rest_timeout: int
+    thread_id: Optional[str] = Field(
+        None, description="Optional unique identifier for the execution thread."
+    )
+
+    rest_timeout: int = Field(
+        30, description="Timeout (in seconds) for REST API requests."
+    )
 
 
 def default_state() -> Dict:
@@ -136,7 +141,7 @@ def node_remote_agent(
     Returns:
         Dict[str, List[BaseMessage]]: Updated state containing server response or error message.
     """
-    if not state["messages"]:
+    if not state.messages:
         logger.error(json.dumps({"error": "GraphState contains no messages"}))
         return Command(
             goto="exception_node",
@@ -144,7 +149,8 @@ def node_remote_agent(
         )
 
     # Extract the latest user query
-    human_message = state["messages"][-1].content
+    messages = state.messages
+    human_message = messages[-1].content
     logger.info(json.dumps({"event": "sending_request", "human": human_message}))
 
     # Request headers
@@ -153,12 +159,12 @@ def node_remote_agent(
         "Content-Type": "application/json",
     }
 
-    messages = convert_to_openai_messages(state["messages"])
+    openai_messages = convert_to_openai_messages(messages)
 
     # payload to send to autogen server at /runs endpoint
     payload = {
         "agent_id": "remote_agent",
-        "input": {"messages": messages},
+        "input": {"messages": openai_messages},
         "model": "gpt-4o",
         "metadata": {"id": str(uuid.uuid4())},
     }
@@ -244,17 +250,17 @@ def node_remote_agent(
 
 # Graph node that makes a stateless request to the Remote Graph Server
 def end_node(state: GraphState) -> Dict[str, Any]:
-    logger.info(f"Thread end: {state.values()}")
+    logger.info(f"Thread end: {state.model_dump().values()}")
     return default_state()
 
 
 def exception_node(state: GraphState):
-    logger.info(f"Exception happen while processing graph: {state["exception_msg"]}")
+    logger.info(f"Exception happen while processing graph: {state.exception_msg}")
     return default_state()
 
 
 # Build the state graph
-def build_graph() -> Any:
+def build_graph() -> CompiledGraph:
     """
     Constructs the state graph for handling requests.
 
@@ -276,7 +282,7 @@ def invoke_graph(
     messages: List[Dict[str, str]],
     graph: Optional[Any] = None,
     remote_agent_url: Optional[str] = None,
-    rest_timeout: Optional[int] = None
+    rest_timeout: Optional[int] = None,
 ) -> Optional[dict[Any, Any] | list[dict[Any, Any]]]:
     """
     Invokes the graph with the given messages and safely extracts the last AI-generated message.
@@ -308,19 +314,18 @@ def invoke_graph(
 
     # Same for rest _timeout
     if rest_timeout is None:
-        rest_timeout = int(os.getenv(
-            "rest_timeout", 30))
+        rest_timeout = int(os.getenv("rest_timeout", 30))
 
     inputs = {"messages": messages}
     logger.debug({"event": "invoking_graph", "inputs": inputs})
 
-    config = {
-        "configurable": {
-            "remote_agent_url": remote_agent_url,
-            "rest_timeout": rest_timeout,
-            "thread_id": str(uuid.uuid4()),
-        }
-    }
+    graph_config = GraphConfig(
+        remote_agent_url=remote_agent_url,
+        rest_timeout=rest_timeout,
+        thread_id=str(uuid.uuid4()),
+    )
+
+    config: RunnableConfig = {"configurable": graph_config.model_dump()}
 
     try:
         if not graph:
@@ -363,7 +368,6 @@ def main():
             "remote_agent_url": remote_agent_url,
             "thread_id": str(uuid.uuid4()),
             "rest_timeout": rest_timeout,
-
         }
     }
     inputs = {"messages": [HumanMessage(content="Write a story about a cat")]}
