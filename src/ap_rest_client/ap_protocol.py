@@ -89,15 +89,25 @@ def decode_response(response_data: Dict[str, Any]) -> Dict[str, Any]:
         return {"error": f"Failed to decode response: {str(e)}"}
 
 
-# Define the graph state
 class GraphState(TypedDict):
-    """Represents the state of the graph, containing a list of messages."""
+    """Represents the state of the graph, containing messages and error details.
+
+    :param messages: List of messages exchanged within the graph session.
+    :param exception_msg: Error message in case of exceptions during execution.
+    """
 
     messages: Annotated[List[BaseMessage], add_messages]
     exception_msg: str
 
 
 class GraphConfig(TypedDict):
+    """Configuration for the graph execution, including remote agent details.
+
+    :param remote_agent_url: URL of the remote agent service.
+    :param thread_id: Unique identifier for the execution thread.
+    :param rest_timeout: Timeout (in seconds) for REST API requests.
+    """
+
     remote_agent_url: str
     thread_id: str
     rest_timeout: int
@@ -276,10 +286,14 @@ def invoke_graph(
     - Returns a meaningful response even if an error occurs.
 
     :param messages: A list of message dictionaries in OpenAI format.
-    :param graph: An optional graph object to use; internal will be built if not provided.
+    :param graph: An optional langgraph CompiledStateGraph object to use; internal will be built if not provided.
     :param remote_agent_url: The URL for the remote agent. Precedence:
                              1) User-provided value,
                              2) Environment variable REMOTE_AGENT_URL,
+                             3) Default fallback.
+    :param rest_timeout: The timeout for REST requests. Precedence:
+                             1) User-provided value,
+                             2) Environment variable REST_TIMEOUT,
                              3) Default fallback.
     :return: The list of all messages returned by the graph.
     """
@@ -338,7 +352,7 @@ def invoke_graph(
 
 def main():
     load_environment_variables()
-    logger = configure_logging()
+    _ = configure_logging()
     remote_agent_url = os.getenv(
         "REMOTE_AGENT_URL", "http://127.0.0.1:8123/api/v1/runs"
     )
