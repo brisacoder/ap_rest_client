@@ -262,7 +262,7 @@ def exception_node(state: GraphState):
 # Build the state graph
 def build_graph() -> CompiledGraph:
     """
-    Constructs the state graph for handling requests.
+    Constructed a compiled graph that can be invoked stand-alone or used in Langgraph Studio
 
     Returns:
         StateGraph: A compiled LangGraph state graph.
