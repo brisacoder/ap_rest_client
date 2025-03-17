@@ -10,23 +10,25 @@ import json
 import logging
 import os
 import traceback
-import uuid
-from typing import Annotated, Any, Dict, List, Literal, Optional, Union
+from typing import Any, Dict, List, Literal, Optional, Union
 
 import requests
 from dotenv import find_dotenv, load_dotenv
-from langchain_core.messages import BaseMessage, HumanMessage
 from langchain_core.messages.utils import convert_to_openai_messages
 from langchain_core.runnables.config import RunnableConfig
 from langgraph.graph import END, START, StateGraph
 from langgraph.graph.graph import CompiledGraph
-from langgraph.graph.message import add_messages
 from langgraph.types import Command
-from pydantic import BaseModel, Field
+
 from requests.exceptions import ConnectionError as RequestsConnectionError
 from requests.exceptions import HTTPError, RequestException, Timeout
 
-from ap_rest_client.logging_config import configure_logging
+from logging_config import configure_logging
+from models.graph_config import RemoteAgentConfig, GraphConfig
+from models.graph_state import GraphState
+
+from langchain_core.messages import AIMessage, BaseMessage, HumanMessage
+
 
 # Step 1: Initialize a basic logger first (to avoid errors before full configuration)
 logger = logging.getLogger()
@@ -87,36 +89,6 @@ def decode_response(response_data: Dict[str, Any]) -> Dict[str, Any]:
         return {"error": f"An unexpected error occurred: {str(e)}"}
 
 
-class GraphState(BaseModel):
-    """Represents the state of the graph, containing messages and an optional error message."""
-
-    messages: Annotated[List[BaseMessage], add_messages] = Field(
-        ..., description="List of messages exchanged within the graph session."
-    )
-
-    exception_msg: Optional[str] = Field(
-        None,
-        description="Optional error message in case of exceptions during execution.",
-    )
-
-
-class GraphConfig(BaseModel):
-    """Configuration for the graph execution, including remote agent details."""
-
-    remote_agent_url: str = Field(
-        "http://127.0.0.1:8123/api/v1/runs",
-        description="URL of the remote agent service. Defaults to local server.",
-    )
-
-    thread_id: Optional[str] = Field(
-        None, description="Optional unique identifier for the execution thread."
-    )
-
-    rest_timeout: int = Field(
-        30, description="Timeout (in seconds) for REST API requests."
-    )
-
-
 def default_state() -> Dict[str, Any]:
     """
     A benign default return for nodes in the graph that do not modify state.
@@ -165,19 +137,22 @@ def node_remote_agent(
 
     # payload to send to autogen server at /runs endpoint
     payload = {
-        "agent_id": "remote_agent",
+        "agent_id": config["configurable"]["remote_agent"]["id"],
         "input": {"messages": openai_messages},
-        "model": "gpt-4o",
-        "metadata": {"id": str(uuid.uuid4())},
+        "model": config["configurable"]["remote_agent"]["model"],
+        "metadata": config["configurable"]["remote_agent"]["metadata"],
     }
 
     # Use a context manager for the session
     with requests.Session() as session:
         try:
-            remote_agent_url = config["configurable"].get("remote_agent_url")
-            rest_timeout = config["configurable"].get("rest_timeout")
+            remote_agent_url = config["configurable"]["remote_agent"]["url"]
+            rest_timeout = config["configurable"]["rest_timeout"]
             response = session.post(
-                remote_agent_url, headers=json_headers, json=payload, timeout=rest_timeout
+                remote_agent_url,
+                headers=json_headers,
+                json=payload,
+                timeout=rest_timeout,
             )
 
             # Raise exception for HTTP errors
@@ -315,21 +290,52 @@ def build_graph() -> CompiledGraph:
     return builder.compile(name="ap_local_agent")
 
 
+def process_graph_config(config: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Processes the graph input to ensure it contains the necessary fields.
+
+    Args:
+        config (Dict[str, Any]): The input dictionary for the graph.
+
+    Returns:
+        Dict[str, Any]: The processed input dictionary with validated fields.
+
+    Raises:
+        ValueError: If mandatory fields are missing or empty.
+    """
+    try:
+        processed_config = {}
+        processed_config["thread_id"] = config.get("thread_id")
+        processed_config["rest_timeout"] = config.get(
+            "rest_timeout", 30
+        )  # Default to 30 seconds
+        remote_agent = config.get("remote_agent", {})
+        processed_config["remote_agent"] = {
+            "url": remote_agent.get("url"),
+            "id": remote_agent.get("id", "remote_agent"),
+            "model": remote_agent.get("model", "gpt-4o"),
+            "metadata": remote_agent.get("metadata", {}),
+        }
+        return processed_config
+
+    except (ValueError, KeyError, TypeError) as e:
+        logger.error("Error processing graph input: %s", e, exc_info=True)
+        raise ValueError(f"Error processing graph input: {e}") from e
+
+
 def invoke_graph(
-    messages: List[Dict[str, str]],
+    messages: List[Dict[str, Any]],  # List of message dictionaries in OpenAI format
+    graph_config: Dict[str, Any],
     graph: Optional[Any] = None,
-    remote_agent_url: Optional[str] = None,
-    rest_timeout: Optional[int] = None,
 ) -> Optional[Union[dict[Any, Any], list[dict[Any, Any]]]]:
     """
     Invokes the graph with the given messages and safely extracts the last AI-generated message.
 
     Args:
-        messages (List[Dict[str, str]]): A list of message dictionaries in OpenAI format.
+        graph_config (Dict[str, Any]): Graph configuration dictionary containing remote agent details and other settings.
+        messages (List[Dict[str, Any]]): List of messages in OpenAI format to be processed by the graph.
         graph (Optional[Any]): An optional langgraph CompiledStateGraph object to use;
         default graph will be built if none provided.
-        remote_agent_url (Optional[str]): The URL for the remote agent.
-        rest_timeout (Optional[int]): The timeout for REST requests.
 
     Returns:
         Optional[Union[
@@ -340,32 +346,15 @@ def invoke_graph(
 
     load_environment_variables()
 
-    # Apply precedence rules for remote_agent_url
-    if remote_agent_url is None:
-        remote_agent_url = os.getenv(
-            "REMOTE_AGENT_URL", "http://127.0.0.1:8123/api/v1/runs"
-        )
+    processed_config = process_graph_config(graph_config)
 
-    # Same for rest_timeout
-    if rest_timeout is None:
-        rest_timeout = int(os.getenv("rest_timeout", "30"))
-
-    inputs = {"messages": messages}
-    logger.debug({"event": "invoking_graph", "inputs": inputs})
-
-    graph_config = GraphConfig(
-        remote_agent_url=remote_agent_url,
-        rest_timeout=rest_timeout,
-        thread_id=str(uuid.uuid4()),
-    )
-
-    config: RunnableConfig = {"configurable": graph_config.model_dump()}
+    config: RunnableConfig = {"configurable": processed_config}
 
     try:
         if not graph:
             graph = build_graph()
 
-        result = graph.invoke(inputs, config=config)
+        result = graph.invoke(input=messages, config=config)
 
         if not isinstance(result, dict):
             raise TypeError(
@@ -406,18 +395,29 @@ def main() -> None:
     try:
         graph = build_graph()
         graph_config = GraphConfig(
-            remote_agent_url=remote_agent_url,
             rest_timeout=rest_timeout,
-            thread_id=str(uuid.uuid4()),
+            # thread_id=str(uuid.uuid4()), If you want to use a specific thread_id, uncomment this line
+            remote_agent=RemoteAgentConfig(
+                url=remote_agent_url,
+                id="remote_agent",
+                model="gpt-4o",
+                metadata={},
+            ),
         )
+
+        messages = {"role": "user", "content": "Write a story about a cat"}
+        # messages = HumanMessage(content="Write a story about a cat")
+        
+         # Example input
         config: RunnableConfig = {"configurable": graph_config.model_dump()}
-        inputs = {"messages": [HumanMessage(content="Write a story about a cat")]}
-        logger.info({"event": "invoking_graph", "inputs": inputs})
-        result = graph.invoke(inputs, config=config)
-        logger.info({"event": "final_result", "result": result})
+        result = graph.invoke(input={"messages": messages}, config=config)
+        logger.info("graph result: %s", result)
+    except (ValueError, KeyError, TypeError, RuntimeError) as e:
+        logger.error("An error occurred in main execution: %s", e, exc_info=True)
     except Exception as e:
         logger.error(
-            "An unexpected error occurred in main execution: %s", e, exc_info=True)
+            "An unexpected error occurred in main execution: %s", e, exc_info=True
+        )
 
 
 # Main execution
