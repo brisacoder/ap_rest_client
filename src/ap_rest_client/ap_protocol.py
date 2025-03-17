@@ -12,6 +12,7 @@ import os
 import traceback
 from typing import Any, Dict, List, Literal, Optional, Union
 
+from pydantic import BaseModel
 import requests
 from dotenv import find_dotenv, load_dotenv
 from langchain_core.messages.utils import convert_to_openai_messages
@@ -23,11 +24,9 @@ from langgraph.types import Command
 from requests.exceptions import ConnectionError as RequestsConnectionError
 from requests.exceptions import HTTPError, RequestException, Timeout
 
-from logging_config import configure_logging
-from models.graph_config import RemoteAgentConfig, GraphConfig
-from models.graph_state import GraphState
-
-from langchain_core.messages import AIMessage, BaseMessage, HumanMessage
+from ap_rest_client.logging_config import configure_logging
+from ap_rest_client.models.graph_config import RemoteAgentConfig, GraphConfig
+from ap_rest_client.models.graph_state import GraphState
 
 
 # Step 1: Initialize a basic logger first (to avoid errors before full configuration)
@@ -324,29 +323,27 @@ def process_graph_config(config: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def invoke_graph(
-    messages: List[Dict[str, Any]],  # List of message dictionaries in OpenAI format
-    graph_config: Dict[str, Any],
+    messages: List[Dict[str, Any]],
+    graph_config: Union[Dict[str, Any], BaseModel],  # Accept both dict and Pydantic model
     graph: Optional[Any] = None,
 ) -> Optional[Union[dict[Any, Any], list[dict[Any, Any]]]]:
     """
     Invokes the graph with the given messages and safely extracts the last AI-generated message.
 
     Args:
-        graph_config (Dict[str, Any]): Graph configuration dictionary containing remote agent details and other settings.
         messages (List[Dict[str, Any]]): List of messages in OpenAI format to be processed by the graph.
-        graph (Optional[Any]): An optional langgraph CompiledStateGraph object to use;
-        default graph will be built if none provided.
+        graph_config (Union[Dict[str, Any], BaseModel]): Graph configuration containing remote agent details.
+        graph (Optional[Any]): An optional langgraph CompiledStateGraph object to use; a default graph 
+                               will be built if none is provided.
 
     Returns:
-        Optional[Union[
-            dict[Any, Any],
-            list[dict[Any, Any]]
-        ]]: The list of all messages returned by the graph.
+        Optional[Union[dict[Any, Any], list[dict[Any, Any]]]]: The list of all messages returned by the graph.
     """
 
-    load_environment_variables()
+    # Ensure graph_config is a dictionary
+    config_dict = graph_config.model_dump() if isinstance(graph_config, BaseModel) else graph_config
 
-    processed_config = process_graph_config(graph_config)
+    processed_config = process_graph_config(config_dict)
 
     config: RunnableConfig = {"configurable": processed_config}
 
@@ -354,12 +351,7 @@ def invoke_graph(
         if not graph:
             graph = build_graph()
 
-        result = graph.invoke(input=messages, config=config)
-
-        if not isinstance(result, dict):
-            raise TypeError(
-                f"Graph invocation returned non-dict result: {type(result)}"
-            )
+        result = graph.invoke(input={"messages": messages}, config=config)
 
         messages_list = convert_to_openai_messages(result.get("messages", []))
         if not isinstance(messages_list, list) or not messages_list:
