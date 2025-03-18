@@ -9,6 +9,7 @@ exceptions.
 import json
 import logging
 import os
+import stat
 import traceback
 from typing import Any, Dict, List, Literal, Optional, Union
 
@@ -16,6 +17,7 @@ from pydantic import BaseModel
 import requests
 from dotenv import find_dotenv, load_dotenv
 from langchain_core.messages.utils import convert_to_openai_messages
+from langchain_core.messages import HumanMessage, BaseMessage
 from langchain_core.runnables.config import RunnableConfig
 from langgraph.graph import END, START, StateGraph
 from langgraph.graph.graph import CompiledGraph
@@ -114,7 +116,7 @@ def node_remote_agent(
     Returns:
         Command[Literal["exception_node", "end_node"]]: Command to transition to the next node.
     """
-    if not state.messages:
+    if not state.thread_state.messages:
         logger.error("GraphState contains no messages")
         return Command(
             goto="exception_node",
@@ -122,7 +124,7 @@ def node_remote_agent(
         )
 
     # Extract the latest user query
-    messages = state.messages
+    messages = state.thread_state.messages
     human_message = messages[-1].content
     logger.info("sending message: %s", human_message)
 
@@ -141,6 +143,9 @@ def node_remote_agent(
         "model": config["configurable"]["remote_agent"]["model"],
         "metadata": config["configurable"]["remote_agent"]["metadata"],
     }
+
+    if state.thread_state.extended_info:
+        payload["input"].update(state.thread_state.extended_info)
 
     # Use a context manager for the session
     with requests.Session() as session:
@@ -171,7 +176,9 @@ def node_remote_agent(
             # In this App we will assume remote agent only create a single new message but
             # this is not always true
 
-            return Command(goto="end_node", update={"messages": messages[-1]})
+            return Command(
+                goto="end_node", update={"input": {"messages": messages[-1]}}
+            )
 
         except Timeout as timeout_err:
             error_msg = {
@@ -271,14 +278,16 @@ def exception_node(state: GraphState) -> Dict[str, Any]:
 
 
 # Build the state graph
-def build_graph() -> CompiledGraph:
+def build_graph(
+    graph_config: Any = GraphConfig, graph_state: Any = GraphState
+) -> CompiledGraph:
     """
     Construct a compiled graph that can be invoked stand-alone or used in Langgraph Studio.
 
     Returns:
         CompiledGraph: A compiled LangGraph state graph.
     """
-    builder = StateGraph(state_schema=GraphState, config_schema=GraphConfig)
+    builder = StateGraph(state_schema=graph_state, config_schema=graph_config)
     builder.add_node("node_remote_agent", node_remote_agent)
     builder.add_node("end_node", end_node)
     builder.add_node("exception_node", exception_node)
@@ -323,9 +332,9 @@ def process_graph_config(config: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def invoke_graph(
-    messages: List[Dict[str, Any]],
-    graph_config: Union[Dict[str, Any], BaseModel],  # Accept both dict and Pydantic model
-    graph: Optional[Any] = None,
+    thread_input: Dict[str, Any],
+    config: Union[Dict[str, Any], BaseModel],  # Accept both dict and Pydantic model
+    graph: CompiledGraph,
 ) -> Optional[Union[dict[Any, Any], list[dict[Any, Any]]]]:
     """
     Invokes the graph with the given messages and safely extracts the last AI-generated message.
@@ -333,7 +342,7 @@ def invoke_graph(
     Args:
         messages (List[Dict[str, Any]]): List of messages in OpenAI format to be processed by the graph.
         graph_config (Union[Dict[str, Any], BaseModel]): Graph configuration containing remote agent details.
-        graph (Optional[Any]): An optional langgraph CompiledStateGraph object to use; a default graph 
+        graph (Optional[Any]): An optional langgraph CompiledStateGraph object to use; a default graph
                                will be built if none is provided.
 
     Returns:
@@ -341,17 +350,15 @@ def invoke_graph(
     """
 
     # Ensure graph_config is a dictionary
-    config_dict = graph_config.model_dump() if isinstance(graph_config, BaseModel) else graph_config
+    config_dict = config.model_dump() if isinstance(config, BaseModel) else config
 
-    processed_config = process_graph_config(config_dict)
+    # processed_config = process_graph_config(config_dict)
 
-    config: RunnableConfig = {"configurable": processed_config}
+    runnable_config: RunnableConfig = {"configurable": config_dict}
 
     try:
-        if not graph:
-            graph = build_graph()
 
-        result = graph.invoke(input={"messages": messages}, config=config)
+        result = graph.invoke(input=thread_input, config=runnable_config)
 
         messages_list = convert_to_openai_messages(result.get("messages", []))
         if not isinstance(messages_list, list) or not messages_list:
@@ -373,6 +380,30 @@ def invoke_graph(
         return [{"role": "assistant", "content": "An unexpected error occurred"}]
 
 
+def build_thread_input(
+    messages: List[BaseMessage], extended_info: Optional[Dict[str, Any]] = None
+) -> Dict[str, Any]:
+    """
+    Constructs the input dictionary for the graph invocation.
+
+    Args:
+        messages (List[Dict[str, Any]]): List of messages in OpenAI format.
+        remote_agent_url (str): The URL of the remote agent.
+        remote_agent_id (str): The ID of the remote agent.
+        metadata (Dict[str, Any]): Metadata for the remote agent.
+        opaque_info (Optional[Dict[str, Any]]): Opaque information to be added under input.
+
+    Returns:
+        Dict[str, Any]: The constructed input dictionary.
+    """
+    thread_input: Dict[str, Any] = {"thread_state": {"messages": messages}}
+    # Add extended_info if provided
+    if extended_info:
+        thread_input["thread_state"]["extended_info"] = extended_info
+
+    return thread_input
+
+
 def main() -> None:
     """
     Main function to load environment variables, configure logging, and invoke the graph.
@@ -385,7 +416,6 @@ def main() -> None:
     )
     rest_timeout = int(os.getenv("REST_TIMEOUT", "30"))
     try:
-        graph = build_graph()
         graph_config = GraphConfig(
             rest_timeout=rest_timeout,
             # thread_id=str(uuid.uuid4()), If you want to use a specific thread_id, uncomment this line
@@ -397,12 +427,25 @@ def main() -> None:
             ),
         )
 
-        messages = {"role": "user", "content": "Write a story about a cat"}
-        # messages = HumanMessage(content="Write a story about a cat")
-        
-         # Example input
-        config: RunnableConfig = {"configurable": graph_config.model_dump()}
-        result = graph.invoke(input={"messages": messages}, config=config)
+        messages: List[BaseMessage] = [
+            HumanMessage(content="Write a story about a cat")
+        ]
+        # Extended info for the graph
+        # This is an example of how to add additional input to the graph
+        github = {
+            "github": {
+                "repo_url": os.getenv("GITHUB_REPO_URL"),
+                "github_token": os.getenv("GITHUB_TOKEN"),
+                "branch": os.getenv("GITHUB_BRANCH"),
+            }
+        }
+        thread_input = build_thread_input(messages=messages, extended_info=github)
+
+        # Build default graph
+        graph = build_graph(GraphConfig, GraphState)
+        result = invoke_graph(
+            thread_input=thread_input, config=graph_config, graph=graph
+        )
         logger.info("graph result: %s", result)
     except (ValueError, KeyError, TypeError, RuntimeError) as e:
         logger.error("An error occurred in main execution: %s", e, exc_info=True)
