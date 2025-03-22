@@ -9,14 +9,13 @@ exceptions.
 import json
 import logging
 import os
-import stat
 import traceback
 from typing import Any, Dict, List, Literal, Optional, Union
 
 from pydantic import BaseModel
 import requests
 from dotenv import find_dotenv, load_dotenv
-from langchain_core.messages.utils import convert_to_openai_messages
+from langchain_core.messages.utils import convert_to_openai_messages, convert_to_messages
 from langchain_core.messages import HumanMessage, BaseMessage
 from langchain_core.runnables.config import RunnableConfig
 from langgraph.graph import END, START, StateGraph
@@ -90,7 +89,7 @@ def decode_response(response_data: Dict[str, Any]) -> Dict[str, Any]:
         return {"error": f"An unexpected error occurred: {str(e)}"}
 
 
-def default_state() -> Dict[str, Any]:
+def default_state(state: GraphState) -> Dict[str, Any]:
     """
     A benign default return for nodes in the graph that do not modify state.
 
@@ -98,7 +97,10 @@ def default_state() -> Dict[str, Any]:
         Dict[str, Any]: Default state with empty messages.
     """
     return {
-        "messages": [],
+        "thread_state": {
+            "messages": [],
+            "extended_info": state.thread_state.extended_info,
+        }
     }
 
 
@@ -169,7 +171,8 @@ def node_remote_agent(
 
             logger.info(decoded_response)
 
-            messages = decoded_response.get("messages", [])
+            ai_messages: List[Dict[Any, Any]] = decoded_response.get("messages", [])
+            base_messages = convert_to_messages(ai_messages)
 
             # This is tricky. In multi-turn conversation we should only add new messages
             # produced by the remote agent, otherwise we will have duplicates.
@@ -177,7 +180,13 @@ def node_remote_agent(
             # this is not always true
 
             return Command(
-                goto="end_node", update={"input": {"messages": messages[-1]}}
+                goto="end_node",
+                update={
+                    "thread_state": {
+                        "messages": state.thread_state.messages + base_messages,
+                        "extended_info": state.thread_state.extended_info,
+                    }
+                },
             )
 
         except Timeout as timeout_err:
@@ -260,7 +269,12 @@ def end_node(state: GraphState) -> Dict[str, Any]:
         Dict[str, Any]: Default state.
     """
     logger.info("Thread end: %s", state.model_dump().values())
-    return default_state()
+    return {
+        "thread_state": {
+            "messages": state.thread_state.messages,
+            "extended_info": state.thread_state.extended_info,
+        }
+    }
 
 
 def exception_node(state: GraphState) -> Dict[str, Any]:
@@ -274,7 +288,7 @@ def exception_node(state: GraphState) -> Dict[str, Any]:
         Dict[str, Any]: Default state.
     """
     logger.info("Exception happen while processing graph: %s", state.exception_msg)
-    return default_state()
+    return default_state(state)
 
 
 # Build the state graph
@@ -360,7 +374,10 @@ def invoke_graph(
 
         result = graph.invoke(input=thread_input, config=runnable_config)
 
-        messages_list = convert_to_openai_messages(result.get("messages", []))
+        thread_state = result.get("thread_state", {})
+        if not thread_state:
+            raise ValueError("Graph result does not contain 'thread_state'.")
+        messages_list = convert_to_openai_messages(thread_state.get("messages", []))
         if not isinstance(messages_list, list) or not messages_list:
             raise ValueError("Graph result does not contain a valid 'messages' list.")
 
